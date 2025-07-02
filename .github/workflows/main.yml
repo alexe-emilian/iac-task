@@ -1,0 +1,145 @@
+name: CI / CD – iac-task
+
+###############################################################################
+#  Triggers
+###############################################################################
+on:
+  push:
+    branches: [dev, prod]        # automatic for dev; gated for prod
+  workflow_dispatch:             # allow manual re-runs or hot-fixes
+
+###############################################################################
+#  Global settings
+###############################################################################
+# Map branch → environment for clarity downstream
+env:
+  AWS_REGION: eu-central-1
+  PROJECT_NAME: iac-task
+
+jobs:
+  ###############################################################################
+  #  1. Build & push image to ECR  (always runs)
+  ###############################################################################
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write           # needed for OIDC auth if you ever switch
+      contents: read
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      ecr_url:   ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Extract metadata (tag, labels)
+        id: meta
+        run: |
+          echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      # ─────────────────── Docker Buildx with layer caching ──────────────────
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        # Satisfies “Use GitHub secrets for sensitive data”
+        with:
+          registry: ${{ env.AWS_REGION }}.amazonaws.com
+          username: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          password: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: true
+
+      - name: Configure build cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build & push Docker image
+        run: |
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}
+          docker buildx build \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to   type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --push \
+            --platform linux/amd64 \
+            -t $IMAGE_URI:${{ steps.meta.outputs.image_tag }} \
+            -t $IMAGE_URI:latest \
+            ./app
+        shell: bash
+
+      - name: Move new cache into place
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  ###############################################################################
+  #  2. Deploy to **dev** automatically on dev branch
+  ###############################################################################
+  deploy-dev:
+    if: github.ref == 'refs/heads/dev'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Deploy via Terraform (dev)
+        working-directory: infra/envs/dev
+        run: |
+          terraform init  -backend-config=backend.hcl
+          terraform apply -auto-approve -input=false \
+            -var="image_tag=${{ needs.build.outputs.image_tag }}"
+        env:
+          TF_IN_AUTOMATION: true
+
+  ###############################################################################
+  #  3. Deploy to **prod** – requires manual approval
+  ###############################################################################
+  deploy-prod:
+    if: github.ref == 'refs/heads/prod'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: prod          # GitHub Environment “prod” must have required reviewers
+      url:  ${{ steps.show-url.outputs.url }}   # will appear in Checks tab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Deploy via Terraform (prod – rolling update)
+        id: tf-apply
+        working-directory: infra/envs/prod
+        run: |
+          terraform init  -backend-config=backend.hcl
+          terraform apply -auto-approve -input=false \
+            -var="image_tag=${{ needs.build.outputs.image_tag }}"
+        env:
+          TF_IN_AUTOMATION: true
+
+      # Optional: surface ALB DNS in the workflow summary
+      - name: Show endpoint
+        id: show-url
+        working-directory: infra/envs/prod
+        run: |
+          echo "url=$(terraform output -raw alb_dns)" >> $GITHUB_OUTPUT
